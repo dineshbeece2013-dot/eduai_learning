@@ -23,7 +23,7 @@ from lecture_engine import LectureEngine
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 LEMONADE_BASE = os.getenv("LEMONADE_BASE", "http://localhost:13305/v1")
-LLM_MODEL     = os.getenv("LLM_MODEL",    "Qwen3-0.6B-GGUF")
+LLM_MODEL     = os.getenv("LLM_MODEL",    "Qwen3.5-4B-GGUF")
 TTS_MODEL     = os.getenv("TTS_MODEL",    "kokoro-v1")
 TTS_VOICE     = os.getenv("TTS_VOICE",    "af_heart")
 STT_MODEL     = os.getenv("STT_MODEL",    "Whisper-Large-v3-Turbo")
