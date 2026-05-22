@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EduAI Classroom</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ── SETUP SCREEN ─────────────────────────────────────────────────── -->
+<div id="screen-setup" class="screen active">
+  <div class="setup-bg">
+    <div class="setup-orb orb1"></div>
+    <div class="setup-orb orb2"></div>
+  </div>
+  <div class="setup-card">
+    <div class="brand">
+      <span class="brand-icon">🎓</span>
+      <h1>EduAI <em>Classroom</em></h1>
+      <p class="brand-sub">Local AI · Lemonade Server · Voice Interactive</p>
+    </div>
+
+    <!-- Lemonade status -->
+    <div class="status-row">
+      <span class="dot" id="lemon-dot"></span>
+      <span class="status-text" id="lemon-status">Checking Lemonade Server…</span>
+      <button class="btn-ghost sm" onclick="checkStatus()">↻ Refresh</button>
+    </div>
+    <div class="model-chips" id="model-chips"></div>
+
+    <!-- Topic input -->
+    <div class="input-group">
+      <label>Lecture Topic</label>
+      <textarea id="topic-input" placeholder="e.g. Introduction to Neural Networks, Photosynthesis, World War II causes…" rows="3"></textarea>
+    </div>
+
+    <div class="row-2">
+      <div class="input-group">
+        <label>Number of Slides</label>
+        <select id="slide-count">
+          <option value="5">5 slides</option>
+          <option value="8" selected>8 slides</option>
+          <option value="12">12 slides</option>
+          <option value="15">15 slides</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>TTS Voice</label>
+        <select id="tts-voice">
+          <option value="af_heart">af_heart (warm female)</option>
+          <option value="af_nova">af_nova (clear female)</option>
+          <option value="am_adam">am_adam (male)</option>
+          <option value="bm_george">bm_george (British male)</option>
+        </select>
+      </div>
+    </div>
+
+    <button class="btn-primary" id="generate-btn" onclick="startGenerate()">
+      <span id="gen-btn-text">✨ Generate Lecture</span>
+      <span id="gen-spinner" class="spinner hidden"></span>
+    </button>
+
+    <p class="hint">The AI will create slides + narration script, then lecture you slide by slide.</p>
+  </div>
+</div>
+
+<!-- ── CLASSROOM SCREEN ──────────────────────────────────────────────── -->
+<div id="screen-classroom" class="screen">
+  <div class="classroom-layout">
+
+    <!-- LEFT: Slide viewer -->
+    <div class="slide-panel">
+      <div class="slide-header">
+        <button class="btn-ghost sm" onclick="backToSetup()">← New Lecture</button>
+        <span class="slide-title-label" id="lecture-title">Lecture</span>
+        <a id="download-pptx" href="#" download class="btn-ghost sm">⬇ PPTX</a>
+      </div>
+
+      <!-- Slide display -->
+      <div class="slide-viewport" id="slide-viewport">
+        <div class="slide-render" id="slide-render">
+          <div class="slide-waiting">
+            <div class="pulse-ring"></div>
+            <p>Ready to begin lecture</p>
+          </div>
+        </div>
+        <div class="slide-nav-overlay">
+          <button class="nav-arrow left"  onclick="prevSlide()" title="Previous">‹</button>
+          <button class="nav-arrow right" onclick="nextSlide()" title="Next">›</button>
+        </div>
+      </div>
+
+      <!-- Progress bar -->
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="progress-label">
+        <span id="slide-counter">Slide 0 / 0</span>
+        <span id="lecture-status" class="status-badge">idle</span>
+      </div>
+
+      <!-- Controls -->
+      <div class="controls">
+        <button class="ctrl-btn" id="btn-start" onclick="startLecture()">▶ Start Lecture</button>
+        <button class="ctrl-btn secondary" id="btn-pause" onclick="togglePause()" disabled>⏸ Pause</button>
+        <button class="ctrl-btn secondary" onclick="prevSlide()">⏮</button>
+        <button class="ctrl-btn secondary" onclick="nextSlide()">⏭</button>
+        <button class="ctrl-btn danger" onclick="stopLecture()">⏹ Stop</button>
+      </div>
+    </div>
+
+    <!-- RIGHT: Chat / Q&A Panel -->
+    <div class="chat-panel">
+      <div class="chat-header">
+        <span>💬 Q&amp;A — Ask the AI</span>
+        <span class="mic-status" id="mic-status"></span>
+      </div>
+
+      <!-- Current slide info -->
+      <div class="slide-info-box" id="slide-info-box">
+        <div class="slide-info-title" id="info-title">—</div>
+        <ul class="slide-info-bullets" id="info-bullets"></ul>
+      </div>
+
+      <!-- Chat messages -->
+      <div class="chat-messages" id="chat-messages">
+        <div class="chat-msg system">
+          👋 Start the lecture, then press the mic button or type to ask questions at any time.
+        </div>
+      </div>
+
+      <!-- Input area -->
+      <div class="chat-input-area">
+        <button class="mic-btn" id="mic-btn" onclick="toggleMic()">
+          <span id="mic-icon">🎤</span>
+        </button>
+        <input type="text" id="text-question" placeholder="Type your question…" 
+               onkeydown="if(event.key==='Enter') sendTextQuestion()">
+        <button class="btn-send" onclick="sendTextQuestion()">Send</button>
+      </div>
+      <p class="mic-hint">Hold mic to record, or type your question above</p>
+
+      <!-- Narration text display -->
+      <div class="narration-box" id="narration-box">
+        <div class="narration-label">Lecturer says:</div>
+        <div class="narration-text" id="narration-text">—</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── AUDIO PLAYER (hidden) ────────────────────────────────────────── -->
+<audio id="audio-player" style="display:none"></audio>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
