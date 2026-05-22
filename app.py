@@ -8,7 +8,6 @@ import base64
 import json
 import os
 import re
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -32,8 +31,8 @@ SLIDES_DIR    = Path("slides")
 SLIDES_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="EduAI Classroom")
-app.mount("/static",  StaticFiles(directory="static"),  name="static")
-app.mount("/slides",  StaticFiles(directory="slides"),  name="slides")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/slides", StaticFiles(directory="slides"), name="slides")
 
 # Active lecture engines  {session_id: LectureEngine}
 sessions: dict[str, LectureEngine] = {}
@@ -49,17 +48,108 @@ class TTSRequest(BaseModel):
     voice: str = TTS_VOICE
 
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
-async def lemonade_chat(messages: list[dict], stream: bool = False) -> str:
+# ─── JSON extraction (handles Qwen3 <think> blocks, markdown fences) ────────
+def extract_json(raw: str) -> dict | None:
+    """
+    Robustly extract a JSON object from LLM output that may contain:
+      - <think>...</think> reasoning blocks (Qwen3)
+      - ```json ... ``` or ``` ... ``` markdown fences
+      - Leading/trailing prose
+    Returns parsed dict or None if extraction fails.
+    """
+    # 1. Strip <think>...</think> blocks (Qwen3 chain-of-thought)
+    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+
+    # 2. Try to pull JSON from a ```json ... ``` fence
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Strip any remaining ``` markers and try whole text
+    text = re.sub(r"```(?:json)?|```", "", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Find the first { ... } block in the text (greedy from first { to last })
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # 5. Last resort: find innermost balanced braces
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    return None
+
+
+def build_fallback_content(prompt: str, num_slides: int) -> dict:
+    """
+    If the LLM cannot produce valid JSON even after retry,
+    generate a minimal valid structure so the user still gets a lecture.
+    """
+    topic = prompt.strip().title()
+    slides = [
+        {
+            "title": topic,
+            "bullets": [f"An introduction to {topic}", "Key concepts and ideas"],
+            "speaker_note": f"Welcome to today's lecture on {topic}. Let's explore the key ideas together.",
+        }
+    ]
+    for i in range(1, num_slides - 1):
+        slides.append({
+            "title": f"Section {i}: Key Concept {i}",
+            "bullets": [
+                f"Important aspect {i}.1 of {topic}",
+                f"Important aspect {i}.2 of {topic}",
+                f"Important aspect {i}.3 of {topic}",
+            ],
+            "speaker_note": f"In this section we cover key concept number {i} related to {topic}.",
+        })
+    slides.append({
+        "title": "Summary & Takeaways",
+        "bullets": [
+            f"{topic} is a broad and important subject",
+            "We covered foundational concepts today",
+            "Further study is recommended",
+        ],
+        "speaker_note": f"That concludes our lecture on {topic}. I hope you found it informative!",
+    })
+    return {"title": topic, "slides": slides}
+
+
+# ─── Lemonade API Helpers ────────────────────────────────────────────────────
+async def lemonade_chat(messages: list[dict], extra_params: dict | None = None) -> str:
     """Call Lemonade /v1/chat/completions (OpenAI-compatible)."""
     payload = {
         "model":       LLM_MODEL,
         "messages":    messages,
-        "stream":      stream,
-        "temperature": 0.7,
-        "max_tokens":  1024,
+        "stream":      False,
+        "temperature": 0.3,
+        "max_tokens":  2048,
     }
-    async with httpx.AsyncClient(timeout=120) as client:
+    if extra_params:
+        payload.update(extra_params)
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             f"{LEMONADE_BASE}/chat/completions",
             json=payload,
@@ -77,7 +167,7 @@ async def lemonade_tts(text: str, voice: str = TTS_VOICE) -> bytes:
         "voice":           voice,
         "response_format": "mp3",
     }
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{LEMONADE_BASE}/audio/speech",
             json=payload,
@@ -138,46 +228,84 @@ async def generate_lecture(req: GenerateRequest):
     """Generate slides + lecture script from a topic prompt."""
     session_id = str(uuid.uuid4())
 
-    # 1. Ask LLM for structured slide content
+    # ── Attempt 1: structured system + user prompt ──────────────────────────
     system = (
-        "You are an expert educator. When given a topic, respond ONLY with valid JSON "
-        "for a presentation. Format:\n"
-        '{"title":"...", "slides":[{"title":"...", "bullets":["..."], '
-        '"speaker_note":"..."}]}\n'
-        "Each speaker_note should be 2-3 conversational sentences the lecturer will say. "
-        "No markdown, no extra text — pure JSON only."
+        "You are an expert educator. Respond ONLY with a single valid JSON object. "
+        "Do NOT include any thinking, explanation, or markdown — pure JSON only.\n"
+        "Schema:\n"
+        '{"title":"string","slides":[{"title":"string","bullets":["string"],"speaker_note":"string"}]}\n'
+        "Rules: speaker_note = 2-3 sentences. bullets = 3-5 items per slide."
     )
     user_msg = (
         f"Create a {req.slides}-slide educational presentation about: {req.prompt}\n"
-        "Include title slide, content slides, and a summary slide."
+        "First slide = title slide. Last slide = summary. Middle slides = content.\n"
+        "Return JSON only."
     )
 
-    raw = await lemonade_chat([
-        {"role": "system",  "content": system},
-        {"role": "user",    "content": user_msg},
-    ])
+    print(f"[INFO] Generating lecture for: {req.prompt!r}")
+    raw = await lemonade_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user_msg}]
+    )
+    print(f"[DEBUG] Raw LLM response (first 400 chars): {raw[:400]!r}")
 
-    # Parse JSON (strip markdown fences if model adds them)
-    json_str = re.sub(r"```(?:json)?|```", "", raw).strip()
-    try:
-        content = json.loads(json_str)
-    except json.JSONDecodeError:
-        raise HTTPException(500, f"LLM returned invalid JSON: {raw[:300]}")
+    content = extract_json(raw)
 
-    # 2. Generate PPTX
+    # ── Attempt 2: no system prompt, just a tight user instruction ──────────
+    if content is None:
+        print("[WARN] Attempt 1 failed, trying simpler prompt…")
+        simple = (
+            f'Create a {req.slides}-slide presentation on "{req.prompt}". '
+            "Reply with ONLY this JSON (no other text):\n"
+            '{"title":"TOPIC","slides":[{"title":"SLIDE_TITLE","bullets":["POINT1","POINT2","POINT3"],"speaker_note":"NARRATION"}]}'
+        )
+        raw2 = await lemonade_chat([{"role": "user", "content": simple}])
+        print(f"[DEBUG] Attempt 2 raw (first 400 chars): {raw2[:400]!r}")
+        content = extract_json(raw2)
+
+    # ── Attempt 3: ask the model to fix its own output ──────────────────────
+    if content is None:
+        print("[WARN] Attempt 2 failed, asking model to output just JSON…")
+        fix_msg = (
+            "The previous response was not valid JSON. "
+            "Output ONLY the JSON object below, filling in real content. "
+            "No thinking tags. No markdown. No explanation:\n"
+            f'{{"title":"{req.prompt}","slides":[{{"title":"Introduction","bullets":["Point 1","Point 2","Point 3"],"speaker_note":"Welcome to this lecture."}}]}}'
+        )
+        raw3 = await lemonade_chat([{"role": "user", "content": fix_msg}])
+        print(f"[DEBUG] Attempt 3 raw (first 400 chars): {raw3[:400]!r}")
+        content = extract_json(raw3)
+
+    # ── Fallback: generate minimal structure locally so the app never breaks ─
+    if content is None:
+        print("[WARN] All LLM attempts failed — using local fallback content")
+        content = build_fallback_content(req.prompt, req.slides)
+
+    # Validate structure
+    if "slides" not in content or not isinstance(content.get("slides"), list):
+        content = build_fallback_content(req.prompt, req.slides)
+
+    # Ensure each slide has required keys
+    for slide in content["slides"]:
+        slide.setdefault("title", "Slide")
+        slide.setdefault("bullets", ["Key point"])
+        slide.setdefault("speaker_note", slide["title"])
+
+    print(f"[INFO] Generated {len(content['slides'])} slides for: {content.get('title')}")
+
+    # Generate PPTX
     pptx_path = SLIDES_DIR / f"{session_id}.pptx"
     await asyncio.to_thread(generate_presentation, content, str(pptx_path))
 
-    # 3. Store session
+    # Store session
     engine = LectureEngine(session_id, content, str(pptx_path))
     sessions[session_id] = engine
 
     return JSONResponse({
         "session_id":  session_id,
         "title":       content.get("title", req.prompt),
-        "slide_count": len(content.get("slides", [])),
+        "slide_count": len(content["slides"]),
         "pptx_url":    f"/slides/{session_id}.pptx",
-        "slides":      content.get("slides", []),
+        "slides":      content["slides"],
     })
 
 
@@ -192,8 +320,8 @@ async def text_to_speech(req: TTSRequest):
 @app.post("/api/stt")
 async def speech_to_text_endpoint(request: Request):
     """Transcribe audio bytes to text via Whisper STT."""
-    body  = await request.body()
-    text  = await lemonade_stt(body)
+    body = await request.body()
+    text = await lemonade_stt(body)
     return JSONResponse({"text": text})
 
 
@@ -254,12 +382,17 @@ async def websocket_lecture(ws: WebSocket, session_id: str):
                     await ws.send_json({"type": "question_received", "text": question})
                     engine.paused = True
                     answer = await answer_question(engine, question)
-                    audio  = await lemonade_tts(answer)
+                    try:
+                        audio = await lemonade_tts(answer)
+                        audio_b64 = base64.b64encode(audio).decode()
+                    except Exception:
+                        audio_b64 = ""
+                    engine.qa_history.append({"q": question, "a": answer})
                     await ws.send_json({
                         "type":      "answer",
                         "question":  question,
                         "answer":    answer,
-                        "audio_b64": base64.b64encode(audio).decode(),
+                        "audio_b64": audio_b64,
                     })
 
             elif action == "stop":
@@ -275,6 +408,9 @@ async def websocket_lecture(ws: WebSocket, session_id: str):
 async def run_lecture(engine: "LectureEngine", ws: WebSocket):
     """Drive the slide-by-slide lecture narration."""
     slides = engine.content.get("slides", [])
+    engine.current_slide = 0
+    engine.stopped = False
+    engine.paused  = False
 
     while engine.current_slide < len(slides):
         if engine.stopped:
@@ -288,7 +424,7 @@ async def run_lecture(engine: "LectureEngine", ws: WebSocket):
         })
 
         # Generate audio for speaker note
-        note = slide.get("speaker_note", " ".join(slide.get("bullets", [])))
+        note = slide.get("speaker_note", "") or " ".join(slide.get("bullets", []))
         if note:
             try:
                 audio = await lemonade_tts(note)
@@ -298,24 +434,26 @@ async def run_lecture(engine: "LectureEngine", ws: WebSocket):
                     "text":        note,
                     "audio_b64":   base64.b64encode(audio).decode(),
                 })
+                # Wait for audio to roughly finish, then pause for reading
+                # Estimate: ~120 words/min TTS → (words/2) seconds
+                words = len(note.split())
+                wait  = max(2, words / 2)
+                await asyncio.sleep(wait)
             except Exception as e:
                 await ws.send_json({"type": "tts_error", "message": str(e)})
+                await asyncio.sleep(3)
 
-        # Wait between slides — check for pause/skip
-        engine.skip_slide    = False
-        engine.go_prev       = False
+        # Check pause before advancing
+        engine.skip_slide = False
+        engine.go_prev    = False
         engine.resume_event.clear()
 
-        wait_seconds = 2  # Small gap before auto-advance
-        await asyncio.sleep(wait_seconds)
-
-        if engine.go_prev:
-            engine.current_slide = max(0, engine.current_slide - 1)
-            continue
-
-        if engine.paused and not engine.skip_slide:
+        if engine.paused and not engine.skip_slide and not engine.stopped:
             await ws.send_json({"type": "waiting_for_resume"})
             await engine.resume_event.wait()
+
+        if engine.stopped:
+            break
 
         if engine.go_prev:
             engine.current_slide = max(0, engine.current_slide - 1)
@@ -328,20 +466,27 @@ async def run_lecture(engine: "LectureEngine", ws: WebSocket):
 
 async def answer_question(engine: "LectureEngine", question: str) -> str:
     """Generate a contextual answer using LLM."""
-    slide = engine.content["slides"][engine.current_slide]
-    ctx   = f"Slide {engine.current_slide + 1}: {slide['title']}\n" + \
-             "\n".join(slide.get("bullets", []))
+    slides = engine.content.get("slides", [])
+    if engine.current_slide < len(slides):
+        slide = slides[engine.current_slide]
+        ctx = f"Current slide: {slide['title']}\nPoints: " + "; ".join(slide.get("bullets", []))
+    else:
+        ctx = f"Topic: {engine.content.get('title', '')}"
 
     messages = [
         {"role": "system",
          "content": (
-             "You are a helpful teacher answering a student's question during a lecture. "
-             "Be concise, clear, and encouraging. 2-4 sentences max."
+             "You are a helpful teacher answering a student question during a lecture. "
+             "Be concise, clear, and friendly. 2-4 sentences only. "
+             "Do not use <think> blocks. Just answer directly."
          )},
         {"role": "user",
-         "content": f"Context (current slide):\n{ctx}\n\nStudent question: {question}"},
+         "content": f"Context:\n{ctx}\n\nStudent question: {question}"},
     ]
-    return await lemonade_chat(messages)
+    answer = await lemonade_chat(messages)
+    # Strip any stray <think> tags the model might still add
+    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+    return answer or "That's a great question! Let me move to the next slide for more context."
 
 
 if __name__ == "__main__":
