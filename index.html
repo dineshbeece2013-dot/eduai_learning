@@ -93,6 +93,13 @@
         </div>
       </div>
 
+      <!-- Image preview overlay -->
+      <div id="slide-image-wrap" class="slide-image-wrap hidden">
+        <img id="slide-image" src="" alt="Slide illustration">
+        <button class="img-close-btn" onclick="closeSlideImage()">✕</button>
+        <div class="img-label">AI Generated Illustration</div>
+      </div>
+
       <!-- Progress bar -->
       <div class="progress-bar-wrap">
         <div class="progress-bar" id="progress-bar"></div>
@@ -109,6 +116,7 @@
         <button class="ctrl-btn secondary" onclick="prevSlide()">⏮</button>
         <button class="ctrl-btn secondary" onclick="nextSlide()">⏭</button>
         <button class="ctrl-btn danger" onclick="stopLecture()">⏹ Stop</button>
+        <button class="ctrl-btn img-btn" id="btn-img" onclick="generateSlideImage()" title="Generate AI illustration for current slide">🖼 Image</button>
       </div>
     </div>
 

@@ -18,6 +18,7 @@ class LectureEngine:
         self.resume_event  = asyncio.Event()
         self.ws            = None             # WebSocket, set at connection time
         self.qa_history: list[dict] = []
+        self.slide_images: dict[int, str] = {}   # slide_index -> image URL
 
     def to_dict(self) -> dict:
         return {
@@ -29,4 +30,5 @@ class LectureEngine:
             "stopped":       self.stopped,
             "pptx_path":     self.pptx_path,
             "qa_history":    self.qa_history,
+            "slide_images":  self.slide_images,
         }
